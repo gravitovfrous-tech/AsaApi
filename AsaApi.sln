@@ -5,6 +5,11 @@ VisualStudioVersion = 17.7.34221.43
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AsaApi", "AsaApi\AsaApi.vcxproj", "{1586E56E-B700-4F77-814E-A0150454949B}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Pickup", "Plugins\Pickup\Pickup.vcxproj", "{1FBD93A4-03F3-427C-AAF9-198B3D34B630}"
+	ProjectSection(ProjectDependencies) = postProject
+		{1586E56E-B700-4F77-814E-A0150454949B} = {1586E56E-B700-4F77-814E-A0150454949B}
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Release|x64 = Release|x64
@@ -12,6 +17,8 @@ Global
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{1586E56E-B700-4F77-814E-A0150454949B}.Release|x64.ActiveCfg = Release|x64
 		{1586E56E-B700-4F77-814E-A0150454949B}.Release|x64.Build.0 = Release|x64
+		{1FBD93A4-03F3-427C-AAF9-198B3D34B630}.Release|x64.ActiveCfg = Release|x64
+		{1FBD93A4-03F3-427C-AAF9-198B3D34B630}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

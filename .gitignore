@@ -292,3 +292,7 @@ __pycache__/
 /out_lib
 /lookup_offsets.py
 /replace_offsets.py
+
+# Plugins build output
+/Plugins/*/out/
+*.ArkApi
