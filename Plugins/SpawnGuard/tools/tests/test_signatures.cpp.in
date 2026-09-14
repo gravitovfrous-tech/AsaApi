@@ -1,0 +1,57 @@
+// Проверки сопоставления подписей хуков (ABI-совместимость).
+// Код плагина подставляется скриптом run_tests.sh - вручную ничего копировать не нужно.
+#include "stubs_win32.hpp"
+#include <iostream>
+
+namespace
+{
+// @PLUGIN_CODE@
+}
+
+static int failures = 0;
+static void expect(bool got, bool want, const char* what)
+{
+    if (got != want) { std::cout << "FAIL: " << what << " (got " << got << ", want " << want << ")\n"; ++failures; }
+    else std::cout << "ok  : " << what << "\n";
+}
+
+int main()
+{
+    const std::string kBuiltIn = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool,APawn*)";
+    std::string note;
+
+    expect(SignaturesAbiCompatible(kBuiltIn, kBuiltIn, &note) && note.empty(),
+        true, "точное совпадение -> совместимо, различий нет");
+
+    const std::string wrong = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TVector<double>,bool,bool,APawn*)";
+    expect(SignaturesAbiCompatible(kBuiltIn, wrong, &note) && !note.empty(),
+        true, "TVector<->TRotator в 6-м параметре -> совместимо (видно в note)");
+    std::cout << "       note: " << note << "\n";
+
+    const std::string ref_vs_ptr = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData*,bool,UE::Math::TRotator<double>,bool,bool,APawn*)";
+    expect(SignaturesAbiCompatible(kBuiltIn, ref_vs_ptr, &note), true, "FPlacementData& vs FPlacementData* -> совместимо");
+
+    const std::string spaces = "APrimalStructure.IsAllowedToBuild(APlayerController *, UE::Math::TVector<double>, UE::Math::TRotator<double>, FPlacementData&, bool, UE::Math::TRotator<double>, bool, bool, APawn*)";
+    expect(SignaturesAbiCompatible(kBuiltIn, spaces, &note), true, "пробелы не мешают");
+
+    const std::string fewer_params = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool)";
+    expect(SignaturesAbiCompatible(kBuiltIn, fewer_params, &note), false, "другое число параметров -> НЕ совместимо");
+
+    const std::string wrong_type = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool,FName)";
+    expect(SignaturesAbiCompatible(kBuiltIn, wrong_type, &note), false, "APawn* vs FName -> НЕ совместимо");
+
+    const std::string small_bool = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool,char)";
+    expect(SignaturesAbiCompatible(kBuiltIn, small_bool, &note), false, "APawn* vs char -> НЕ совместимо");
+
+    const std::string other_method = "APrimalStructure.FinalStructurePlacement(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,UE::Math::TRotator<double>,APawn*,FName,bool,FPlacementData&)";
+    expect(SignaturesAbiCompatible(kBuiltIn, other_method, &note), false, "другой метод -> НЕ совместимо");
+
+    std::vector<std::string> parts = SplitTopLevel("TArray<APrimalStructure*, TSizedDefaultAllocator<32>>*,bool,int");
+    expect(parts.size() == 3 && parts[0] == "TArray<APrimalStructure*, TSizedDefaultAllocator<32>>*", true, "запятая внутри <> не разделяет параметры");
+
+    const std::string no_params = "AShooterGameMode.BeginPlay()";
+    expect(SignaturesAbiCompatible(no_params, no_params, &note) && note.empty(), true, "метод без параметров");
+
+    std::cout << (failures ? "ПРОВАЛЕНО: " : "ВСЕ ТЕСТЫ ПРОЙДЕНЫ, ошибок: ") << failures << "\n";
+    return failures ? 1 : 0;
+}

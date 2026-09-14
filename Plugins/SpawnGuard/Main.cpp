@@ -90,7 +90,7 @@ namespace
 	// update changes a signature, the hook fails, the plugin logs an error and
 	// keeps running with the remaining checks.
 	constexpr const char* kHookIsAllowedToBuild =
-		"APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TVector<double>,bool,bool,APawn*)";
+		"APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool,APawn*)";
 	constexpr const char* kHookFinalStructurePlacement =
 		"APrimalStructure.FinalStructurePlacement(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,UE::Math::TRotator<double>,APawn*,FName,bool,FPlacementData&)";
 	constexpr const char* kHookGameModeBeginPlay = "AShooterGameMode.BeginPlay()";
@@ -1664,10 +1664,192 @@ namespace
 		return static_cast<int>(matches.size());
 	}
 
+	// ---- signature comparison -------------------------------------------------
+	//
+	// The name passed to SetHook is a *cache key*: it must be byte-identical to
+	// the string ArkApi looks the offset up by. Those strings are copied from
+	// the generated headers, and one mistyped type is enough to lose the hook
+	// (exactly that happened here: the sixth parameter of IsAllowedToBuild was
+	// written as TVector<double> instead of TRotator<double>, so the plugin
+	// refused to hook and blocked nothing).
+	//
+	// To stop a mere typo from silently disabling protection, a cache key is
+	// also accepted when it is *ABI-compatible* with the compiled hook: same
+	// method, same parameter count, and every parameter either equals the
+	// declared type or differs only in a way that occupies the same storage
+	// (see ParamsAbiCompatible). The hook body must then treat such parameters
+	// as opaque - never read them as the declared type.
+
+	// Splits "a,b,c" at the top level; commas inside <> () [] do not count.
+	std::vector<std::string> SplitTopLevel(const std::string& text)
+	{
+		std::vector<std::string> parts;
+		std::string current;
+		int depth = 0;
+
+		for (std::size_t i = 0; i < text.size(); ++i)
+		{
+			const char c = text[i];
+			if (c == '<' || c == '(' || c == '[')
+				++depth;
+			else if (c == '>' || c == ')' || c == ']')
+				--depth;
+
+			if (c == ',' && depth == 0)
+			{
+				parts.push_back(current);
+				current.clear();
+				continue;
+			}
+			current += c;
+		}
+
+		if (!current.empty() || !parts.empty())
+			parts.push_back(current);
+
+		for (std::size_t i = 0; i < parts.size(); ++i)
+		{
+			const std::size_t first = parts[i].find_first_not_of(" \t");
+			if (first == std::string::npos)
+			{
+				parts[i].clear();
+				continue;
+			}
+			const std::size_t last = parts[i].find_last_not_of(" \t");
+			parts[i] = parts[i].substr(first, last - first + 1);
+		}
+
+		return parts;
+	}
+
+	// "Class.Method(int,bool)" -> prefix "Class.Method(" + {"int","bool"}
+	bool SplitSignature(const std::string& signature, std::string& prefix,
+		std::vector<std::string>& params)
+	{
+		const std::size_t open = signature.find('(');
+		const std::size_t close = signature.rfind(')');
+		if (open == std::string::npos || close == std::string::npos || close < open)
+			return false;
+
+		prefix = signature.substr(0, open + 1);
+		const std::string inside = signature.substr(open + 1, close - open - 1);
+		params.clear();
+		if (!inside.empty())
+			params = SplitTopLevel(inside);
+		return true;
+	}
+
+	// A reference is a pointer at the ABI level, "const T*" and "T*" are
+	// passed in the same register, spaces are irrelevant.
+	std::string NormalizeParamType(const std::string& type)
+	{
+		std::string out;
+		for (std::size_t i = 0; i < type.size(); ++i)
+		{
+			const char c = type[i];
+			if (c == ' ' || c == '\t')
+				continue;
+			out += (c == '&') ? '*' : c;
+		}
+
+		if (out.compare(0, 5, "const") == 0)
+			out.erase(0, 5);
+
+		return out;
+	}
+
+	bool ParamsAbiCompatible(const std::string& expected, const std::string& cache)
+	{
+		const std::string a = NormalizeParamType(expected);
+		const std::string b = NormalizeParamType(cache);
+		if (a == b)
+			return true;
+
+		// Same layout, same passing: both are three doubles (24 bytes). Only
+		// these two names appear in the generated ARK headers for such pairs.
+		static const char* kEquivalent[][2] = {
+			{ "UE::Math::TVector<double>", "UE::Math::TRotator<double>" },
+			{ "UE::Math::TVector<float>",  "UE::Math::TRotator<float>" },
+			{ "FVector",                   "FRotator" }
+		};
+
+		for (std::size_t i = 0; i < sizeof(kEquivalent) / sizeof(kEquivalent[0]); ++i)
+		{
+			if ((a == kEquivalent[i][0] && b == kEquivalent[i][1])
+				|| (a == kEquivalent[i][1] && b == kEquivalent[i][0]))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// True when the cache key can be used for the compiled hook. `note` gets a
+	// human-readable list of the positions that had to be substituted.
+	bool SignaturesAbiCompatible(const std::string& expected, const std::string& cache,
+		std::string* note)
+	{
+		std::string expected_prefix, cache_prefix;
+		std::vector<std::string> expected_params, cache_params;
+
+		if (!SplitSignature(expected, expected_prefix, expected_params)
+			|| !SplitSignature(cache, cache_prefix, cache_params))
+			return false;
+
+		if (expected_prefix != cache_prefix)
+			return false;
+
+		if (expected_params.size() != cache_params.size())
+		{
+			if (note)
+				*note = "parameter count: " + std::to_string(cache_params.size())
+					+ " in the cache vs " + std::to_string(expected_params.size()) + " in the plugin";
+			return false;
+		}
+
+		std::string differences;
+		for (std::size_t i = 0; i < expected_params.size(); ++i)
+		{
+			if (ParamsAbiCompatible(expected_params[i], cache_params[i]))
+			{
+				if (NormalizeParamType(expected_params[i]) != NormalizeParamType(cache_params[i]))
+				{
+					differences += (differences.empty() ? "" : ", ");
+					differences += "param " + std::to_string(i + 1) + ": plugin '" + expected_params[i]
+						+ "' vs cache '" + cache_params[i] + "'";
+				}
+				continue;
+			}
+
+			if (note)
+				*note = "param " + std::to_string(i + 1) + ": plugin '" + expected_params[i]
+					+ "' vs cache '" + cache_params[i] + "'";
+			return false;
+		}
+
+		if (note)
+			*note = differences;
+		return true;
+	}
+
+	// Diagnostics that repeat on every init attempt (Plugin_Init, then the
+	// retry from the timer) are printed once at full size, later as debug.
+	bool LogProblemOnce(const std::string& key)
+	{
+		static std::vector<std::string> seen;
+		if (std::find(seen.begin(), seen.end(), key) != seen.end())
+			return false;
+		seen.push_back(key);
+		return true;
+	}
+
 	struct HookName
 	{
 		std::string name;                     // empty = do not install the hook
 		bool in_cache = false;                // the name is present in the offset cache
+		bool substituted = false;             // name taken from the cache, not byte-equal to `expected`
+		std::string substitution_note;        // what exactly differs (for the log)
 		CacheFile cache;
 		std::vector<std::string> variants;    // what the cache has for this method
 	};
@@ -1707,25 +1889,91 @@ namespace
 			}
 		}
 
+		// No byte-identical key. Accept a cache key that is ABI-compatible with
+		// the compiled hook, but only when exactly one such key exists: picking
+		// between several look-alike overloads by chance could hand the hook the
+		// wrong offset and take the server down.
 		if (result.cache.found)
+		{
+			std::vector<std::string> compatible;
+			std::vector<std::string> notes;
+
+			for (const auto& v : result.variants)
+			{
+				std::string note;
+				if (SignaturesAbiCompatible(expected, v, &note))
+				{
+					compatible.push_back(v);
+					notes.push_back(note);
+				}
+			}
+
+			if (compatible.size() == 1)
+			{
+				result.name = compatible[0];
+				result.in_cache = true;
+				result.substituted = true;
+				result.substitution_note = notes[0];
+
+				if (LogProblemOnce("subst|" + compatible[0]))
+				{
+					Log::GetLog()->warn("SpawnGuard: using the ABI-compatible name of '{}' from the offset "
+						"cache (the built-in name is out of date - please report it):", method_prefix);
+					Log::GetLog()->warn("SpawnGuard:   cache:    {}", compatible[0]);
+					Log::GetLog()->warn("SpawnGuard:   built-in: {}", expected);
+					if (!notes[0].empty())
+						Log::GetLog()->warn("SpawnGuard:   differences that are safe: {}", notes[0]);
+				}
+
+				return result;
+			}
+
+			if (compatible.size() > 1)
+			{
+				Log::GetLog()->error("SpawnGuard: {} ABI-compatible cache keys match '{}' - refusing to "
+					"guess, set General.HookNameOverrides manually:", compatible.size(), method_prefix);
+				for (const auto& c : compatible)
+					Log::GetLog()->error("SpawnGuard:   {}", c);
+			}
+
 			result.name.clear();          // cache exists: never guess, see the section comment
+		}
 		else
+		{
 			result.name = expected;       // no cache to check against - try as before
+		}
 
 		return result;
 	}
 
-	void LogHookNameProblem(const char* what, const std::string& expected, const HookName& info)
+	void LogHookNameProblem(const char* what, const std::string& expected, const HookName& info,
+		bool core_gate)
 	{
+		// The init sequence runs twice (Plugin_Init, then the retry from the
+		// timer): print the details once, then only a short reminder. The key
+		// includes the cache path and the variants, so a changed cache is
+		// reported in full again.
+		std::string key = std::string(what) + "|" + (info.cache.found ? info.cache.apath : std::string("-"));
+		for (const auto& v : info.variants)
+			key += "|" + v;
+
 		if (!info.variants.empty())
 		{
-			Log::GetLog()->error("SpawnGuard: '{}' has a different signature in the offset cache.", what);
-			for (const auto& v : info.variants)
-				Log::GetLog()->error("SpawnGuard:   cache:    {}", v);
-			Log::GetLog()->error("SpawnGuard:   expected: {}", expected);
-			Log::GetLog()->error("SpawnGuard: the hook was NOT installed (avoids Sleep(10000) + a throwing "
-				"path in the core). Paste the correct name into General.HookNameOverrides in config.json: "
-				"the parameter list must match the DECLARE_HOOK in Main.cpp, otherwise the server will crash.");
+			if (LogProblemOnce(key))
+			{
+				Log::GetLog()->error("SpawnGuard: '{}' has a different signature in the offset cache.", what);
+				for (const auto& v : info.variants)
+					Log::GetLog()->error("SpawnGuard:   cache:    {}", v);
+				Log::GetLog()->error("SpawnGuard:   expected: {}", expected);
+				Log::GetLog()->error("SpawnGuard: the hook was NOT installed (avoids Sleep(10000) + a throwing "
+					"path in the core). If the cache name is wrong, paste the full parameter list from your "
+					"build's cached_offsets.cache into General.HookNameOverrides in config.json - it must match "
+					"the DECLARE_HOOK in Main.cpp, otherwise the server will crash (README, section 7).");
+			}
+			else
+			{
+				Log::GetLog()->error("SpawnGuard: '{}' is still not installed (details above).", what);
+			}
 		}
 		else if (info.cache.found)
 		{
@@ -1739,22 +1987,17 @@ namespace
 		{
 			Log::GetLog()->warn("SpawnGuard: offset cache not found, '{}' was tried as-is.", what);
 		}
-	}
 
-	// ------------------------------------------------------------------------
-	// commands
-	// ------------------------------------------------------------------------
-
-	std::string SanitizeZoneName(std::string s)
-	{
-		for (char& c : s)
+		// The first gate is the only check that stops placement: without it the
+		// plugin does nothing at all, and silence would be far more dangerous
+		// than one loud line.
+		if (core_gate && info.name.empty())
 		{
-			if (c == '"' || c == '\'' || c == '{' || c == '}' || c == '\\')
-				c = '_';
+			Log::GetLog()->error("SpawnGuard: ---------------------------------------------------------------");
+			Log::GetLog()->error("SpawnGuard: PLACEMENT BLOCKING IS OFF - nothing is being restricted.");
+			Log::GetLog()->error("SpawnGuard: close to spawn points/drops/notes CAN be built right now.");
+			Log::GetLog()->error("SpawnGuard: ---------------------------------------------------------------");
 		}
-		if (s.size() > 48)
-			s.resize(48);
-		return s;
 	}
 
 	// AsaApi hands the WHOLE command line to the callback ("SG.AddPoint Base 15"),
@@ -1967,6 +2210,18 @@ namespace
 			+ (g_final_hook_installed ? g_hook_name_final : std::string("off")));
 		Reply(pc, std::string("GameMode.BeginPlay hook: ")
 			+ (g_begin_play_hook_installed ? g_hook_name_begin_play : std::string("NOT INSTALLED")));
+
+		// The installed name and the built-in one must be identical: any
+		// difference means either General.HookNameOverrides is set or the plugin
+		// fell back to an ABI-compatible cache name, and then the built-in string
+		// has to be updated in Main.cpp (otherwise the same mismatch will hit
+		// again after a config reset).
+		if (g_allow_hook_installed && g_hook_name_is_allowed != kHookIsAllowedToBuild)
+			Reply(pc, std::string("note: the installed name differs from the built-in one (") +
+				(g_config.hook_name_is_allowed.empty() ? "ABI-compatible substitution"
+					: "General.HookNameOverrides") + ") - consider fixing the built-in string");
+		if (g_final_hook_installed && g_hook_name_final != kHookFinalStructurePlacement)
+			Reply(pc, "note: FinalStructurePlacement was installed under a non-built-in name");
 
 		const CacheFile cache = FindOffsetCacheFile();
 		if (!cache.found)
@@ -2239,7 +2494,7 @@ namespace
 			}
 			else
 			{
-				LogHookNameProblem("APrimalStructure.IsAllowedToBuild", kHookIsAllowedToBuild, info);
+				LogHookNameProblem("APrimalStructure.IsAllowedToBuild", kHookIsAllowedToBuild, info, true);
 			}
 		}
 
@@ -2275,7 +2530,7 @@ namespace
 			else
 			{
 				LogHookNameProblem("APrimalStructure.FinalStructurePlacement",
-					kHookFinalStructurePlacement, info);
+					kHookFinalStructurePlacement, info, false);
 			}
 		}
 		else if (!g_config.enforce_on_final_placement && g_final_hook_installed)
@@ -2450,7 +2705,7 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 		}
 		else
 		{
-			LogHookNameProblem("AShooterGameMode.BeginPlay", kHookGameModeBeginPlay, begin_play);
+			LogHookNameProblem("AShooterGameMode.BeginPlay", kHookGameModeBeginPlay, begin_play, false);
 		}
 
 		if (!g_begin_play_hook_installed)
