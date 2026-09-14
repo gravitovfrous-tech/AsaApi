@@ -9,7 +9,14 @@
         "MessageCooldownSeconds": 2.0,
         "DebugLogPlacements": false,
         "DebugLogLines": 8,
-        "EnforceOnFinalPlacement": false
+        "EnforceOnFinalPlacement": false,
+
+        "_HookNameOverrides_comment": "Пусто = имя берётся из ArkApi/Cache/.../cached_offsets.cache. Если после обновления игры в логе 'Failed to get the offset of ...' — смотрите имя там же командой 'cheat SG.Hooks' и вписывайте сюда ТОЧНУЮ строку из кэша. Внимание: список параметров должен совпадать с DECLARE_HOOK в Main.cpp, иначе сервер упадёт.",
+        "HookNameOverrides": {
+            "IsAllowedToBuild": "",
+            "FinalStructurePlacement": "",
+            "GameModeBeginPlay": ""
+        }
     },
 
     "SpawnPoints": {

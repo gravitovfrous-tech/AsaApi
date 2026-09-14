@@ -183,6 +183,38 @@ python Plugins/SpawnGuard/tools/check_macro_collisions.py
 `UNLIKELY`, `CA_ASSUME` (плюс `min`/`max` из `Windows.h` — в файле они
 `#undef`-нуты в начале).
 
+### 1.13 Проверка имени хука по кэшу оффсетов + команда `SG.Hooks`
+
+Строка хука зависит от билда игры (например, в параметрах может быть
+`FPlacementData&` вместо `FPlacementData*` или отсутствовать `APawn*`), поэтому
+жёстко зашитая строка рано или поздно перестаёт существовать в кэше:
+
+```
+[API][critical] Failed to get the offset of 'APrimalStructure.IsAllowedToBuild(...)'.
+Requested by: plugin SpawnGuard
+```
+
+Теперь плагин **читает `ArkApi\Cache\...\cached_offsets.cache`** (это бинарная
+сериализация `unordered_map<string, intptr_t>`, формат см. в
+`AsaApi/Core/Private/Cache.h`) и:
+
+* если точное имя есть в кэше — ставит хук по нему (обычный случай);
+* если имя есть, но с другим списком параметров — пишет в лог **и ожидаемую
+  строку, и то, что лежит в кэше**, и хук **не ставит** (сервер остаётся жив);
+* если имени нет вовсе — пишет, сколько в кэше всего имён `APrimalStructure.*`
+  и предлагает перекачать кэш (удалить `ArkApi\Cache` и перезапустить сервер);
+* если файла кэша нет — работает как раньше (пробует дефолтную строку).
+
+Появилась команда `cheat SG.Hooks`: показывает, какие хуки стоят, какие строки
+к ним применены, путь к кэшу и **все** ключи кэша, начинающиеся с
+`APrimalStructure.IsAllowedToBuild(`. Этого достаточно, чтобы после патча игры
+починить плагин без пересборки: строка из кэша вписывается в
+`General.HookNameOverrides` и делается `cheat SG.Reload`.
+
+В комплекте также консольные утилиты для чтения кэша:
+`tools/dump_offset_name.ps1` (PowerShell, работает на сервере без Python) и
+`tools/dump_offset_name.py`.
+
 ### 1.12 RCON-перезагрузка работала в чужом потоке
 
 Пакеты RCON обрабатываются отдельным потоком, а `RconReload` вызывал
@@ -279,6 +311,7 @@ python Plugins/SpawnGuard/tools/check_macro_collisions.py
 | `cheat SG.Rescan` | принудительный полный рескан (сбрасывает «заморозку» заметок/объёмов) |
 | `cheat SG.List` | счётчики (спавны, объёмы, ящики, заметки, зоны), состояние хуков, значение блокировки, список зон |
 | `cheat SG.Near` | ваши координаты и ближайшая защищённая точка (в фундаментах) |
+| `cheat SG.Hooks` | состояние хуков, применённые имена, путь к кэшу оффсетов и все ключи кэша для `IsAllowedToBuild` |
 | `cheat SG.AddPoint <Имя> [Радиус_в_фундаментах]` | добавить кастомную зону в текущей позиции |
 | `cheat SG.RemovePoint <Имя>` | удалить кастомную зону |
 
@@ -365,7 +398,100 @@ SpawnGuard: note-candidate class: ...   <- подсказки для NameContain
 
 ---
 
-## 6. Известные ограничения
+## 7. Если в логе `Failed to get the offset of ...`
+
+Это значит, что строки, которую плагин передаёт в `SetHook`, нет в кэше оффсетов
+**вашего** билда игры.
+
+Что при этом происходит в ядре (`AsaApi/Core/Private/Offsets.cpp`):
+
+```cpp
+if (!offsets_dump_.contains(name)) {
+    Log::GetLog()->critical("Failed to get the offset of '{}'...", ...);
+    Log::GetLog()->flush();
+    if (hooks_do_not_throw_) return nullptr;
+    Sleep(10000);
+    throw;              // <-- без активного исключения => std::terminate
+}
+```
+
+То есть при `"HooksDoNotThrow": false` (значение по умолчанию) сервер
+замирает на 10 секунд и падает. **Поставьте `true`** в `config.json` рядом с
+`ArkAscendedServer.exe` (в репозитории этот файл лежит как `Configs/config.json`),
+внутри блока `settings`:
+
+```json
+{
+  "settings": {
+    "HooksDoNotThrow": true
+  }
+}
+```
+
+Тогда промах по имени даёт только запись `[error]` в логе (`ArkApi.log` в папке
+`<server>\ShooterGame\Win64\logs\`).
+
+Начиная с версии 2.0.1 плагин до вызова `SetHook` сверяет имя с кэшем, поэтому
+при несовпадении хука просто не будет (плагин живой, блокировка выключена,
+в логе — точная диагностика), а не «критикал + пауза».
+
+### Как посмотреть, что лежит в кэше
+
+Из игры: `cheat SG.Hooks` — команда печатает все подходящие ключи.
+
+На сервере, без перезапуска (PowerShell, из папки `...\ShooterGame\Binaries\Win64`):
+
+```powershell
+.\ArkApi\Plugins\SpawnGuard\tools\dump_offset_name.ps1 -Pattern IsAllowedToBuild
+```
+
+Или вручную, одной строкой:
+
+```powershell
+Get-ChildItem -Path .\ArkApi -Recurse -Filter cached_offsets.cache | ForEach-Object {
+  $fs=[IO.File]::OpenRead($_.FullName); $br=New-Object IO.BinaryReader($fs)
+  while ($fs.Position -lt $fs.Length) {
+    $len=$br.ReadUInt64()
+    if ($len -eq 0 -or $len -gt 1048576) { break }
+    $key=[Text.Encoding]::UTF8.GetString($br.ReadBytes([int]$len)); $null=$br.ReadInt64()
+    if ($key -like "*IsAllowedToBuild*") { $key }
+  }
+  $br.Dispose(); $fs.Dispose()
+}
+```
+
+### Что делать с результатом
+
+1. **В кэше нет ни одного ключа `APrimalStructure.IsAllowedToBuild(`** —
+   функция в этом билде называется иначе или её нет. Смотрите шире:
+   `dump_offset_name.ps1 -Pattern "AllowedToBuild"` и `-Pattern "APrimalStructure."`.
+   Если кэш вообще пустой/битый — удалите папку `ArkApi\Cache` и перезапустите
+   сервер: ArkApi скачает кэш под текущий `ShooterGame.exe`.
+2. **Имя есть, но список параметров другой** — проверьте, чем он отличается
+   (`FPlacementData&` против `FPlacementData*`, наличие `APawn*` в конце и т.п.).
+   Если отличие только в последнем параметре, обновите `DECLARE_HOOK` и
+   `Hook_...` в `Main.cpp` под новую сигнатуру и пересоберите плагин.
+3. **Имя из кэша полностью подходит** (совпадает с тем, что компилировали) —
+   впишите его в `config.json`:
+
+```json
+"General": {
+    "HookNameOverrides": {
+        "IsAllowedToBuild": "APrimalStructure.IsAllowedToBuild(...скопировать точно...)",
+        "FinalStructurePlacement": "",
+        "GameModeBeginPlay": ""
+    }
+}
+```
+
+   и выполните `cheat SG.Reload`. Пересборка не нужна.
+
+> ⚠️ `HookNameOverrides` — это «force». Плагин предупредит в логе, если строки
+> нет в кэше, но всё равно её использует. Если список параметров строки не
+> совпадёт с `DECLARE_HOOK`, сервер упадёт при первой установке структуры,
+> поэтому копируйте строку из кэша целиком и сверяйте параметры.
+
+## 8. Известные ограничения
 
 * Плагин блокирует установку **на сервере**: призрак структуры у клиента не
   краснеет (клиентская проверка идёт в процессе игрока), но установка

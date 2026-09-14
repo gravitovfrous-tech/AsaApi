@@ -56,7 +56,9 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -292,6 +294,12 @@ namespace
 		int block_return_value = 1;               // 0 = "no reason to block"
 		bool enforce_on_final_placement = false;  // optional second gate
 
+		// Overrides for the hook names (see General.HookNameOverrides). Empty =
+		// take the name from the offset cache / the built-in default.
+		std::string hook_name_is_allowed;
+		std::string hook_name_final_placement;
+		std::string hook_name_begin_play;
+
 		ZoneRules spawn;                          // [SpawnPoints]
 		ZoneRules drops;                          // [SupplyDrops]
 		ZoneRules notes;                          // [ExplorerNotes]
@@ -386,6 +394,14 @@ namespace
 	bool g_samples_logged = false;
 	bool g_allow_hook_installed = false;
 	bool g_final_hook_installed = false;
+	bool g_begin_play_hook_installed = false;
+
+	// Names actually handed to SetHook/DisableHook (may differ from the built-in
+	// constants when the offset cache of the running game build uses another
+	// parameter list).
+	std::string g_hook_name_is_allowed = kHookIsAllowedToBuild;
+	std::string g_hook_name_final = kHookFinalStructurePlacement;
+	std::string g_hook_name_begin_play = kHookGameModeBeginPlay;
 	UWorld* g_last_world = nullptr;
 	std::unordered_map<const void*, std::chrono::steady_clock::time_point> g_last_notify;
 
@@ -530,6 +546,14 @@ namespace
 			cfg.message_cooldown_seconds = 0.0;
 		cfg.block_return_value = general.value("BlockReturnValue", 1);
 		cfg.enforce_on_final_placement = general.value("EnforceOnFinalPlacement", false);
+
+		const auto hook_names = general.value("HookNameOverrides", nlohmann::json::object());
+		if (hook_names.is_object())
+		{
+			cfg.hook_name_is_allowed = hook_names.value("IsAllowedToBuild", std::string());
+			cfg.hook_name_final_placement = hook_names.value("FinalStructurePlacement", std::string());
+			cfg.hook_name_begin_play = hook_names.value("GameModeBeginPlay", std::string());
+		}
 
 		ReadZoneRules(j.value("SpawnPoints", nlohmann::json::object()), cfg.spawn, 8.0,
 			"RangeInFoundations", "You cannot build near a player spawn point!");
@@ -1431,6 +1455,200 @@ namespace
 	}
 
 	// ------------------------------------------------------------------------
+	// offset cache access
+	//
+	// AsaApi keeps the authoritative list of hookable names for the exact game
+	// build in "ArkApi/Cache/.../cached_offsets.cache". The file is a binary
+	// serialized unordered_map<string, intptr_t>:
+	//
+	//     repeat: [uint64 key_size][key bytes][int64 value]
+	//
+	// (see Cache::validateSerializedMap in AsaApi/Core/Private/Cache.h)
+	//
+	// Why the plugin reads it: the parameter list of a hook name depends on the
+	// game build ("FPlacementData&" vs "FPlacementData*", an extra APawn*, ...).
+	// Handing a name that is not in this file to SetHook/GetAddress leads to
+	// "Failed to get the offset of ...", and with Configs/config.json
+	// HooksDoNotThrow:false the core then does Sleep(10000) and a throwing path.
+	// So the name is verified against the cache first and, if it does not match,
+	// the hook is simply not installed - the server stays alive and the log says
+	// exactly which names the cache does contain.
+	// ------------------------------------------------------------------------
+
+	using fsys = std::filesystem;
+
+	bool ScanOffsetCacheForKeys(const std::string& path, const std::string& prefix,
+		std::vector<std::string>& matches)
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (!in.is_open())
+			return false;
+
+		while (in.good())
+		{
+			std::uint64_t key_size = 0;
+			in.read(reinterpret_cast<char*>(&key_size), sizeof(key_size));
+			if (!in || key_size == 0 || key_size > (1ULL << 20))
+				break;
+
+			std::string key(static_cast<size_t>(key_size), '\0');
+			in.read(key.data(), static_cast<std::streamsize>(key_size));
+			if (!in)
+				break;
+
+			std::int64_t value = 0;
+			in.read(reinterpret_cast<char*>(&value), sizeof(value));
+			if (!in)
+				break;
+
+			if (key.size() >= prefix.size() && key.compare(0, prefix.size(), prefix) == 0)
+				matches.push_back(std::move(key));
+		}
+		return !matches.empty();
+	}
+
+	int CountOffsetCacheKeysWithPrefix(const std::string& path, const std::string& prefix)
+	{
+		std::vector<std::string> matches;
+		ScanOffsetCacheForKeys(path, prefix, matches);
+		return static_cast<int>(matches.size());
+	}
+
+	std::string FindOffsetCacheFile()
+	{
+		std::error_code ec;
+		const fsys::path cwd(AsaApi::Tools::GetCurrentDir());
+		const fsys::path cache_root = cwd / "ArkApi" / "Cache";
+
+		std::string best;
+		fsys::file_time_type best_time{};
+		bool have = false;
+
+		auto consider = [&](const fsys::path& p)
+		{
+			std::error_code e;
+			if (!fsys::is_regular_file(p, e) || e)
+				return;
+			const auto t = fsys::last_write_time(p, e);
+			if (!have || e || t > best_time)
+			{
+				have = true;
+				best = p.string();
+				best_time = e ? fsys::file_time_type{} : t;
+			}
+		};
+
+		consider(cache_root / "cached_offsets.cache");
+		consider(cwd / "ArkApi" / "cached_offsets.cache");
+		consider(cwd / "cached_offsets.cache");
+
+		if (fsys::is_directory(cache_root, ec))
+		{
+			fsys::recursive_directory_iterator it(
+				cache_root, fsys::directory_options::skip_permission_denied, ec);
+			const fsys::recursive_directory_iterator end;
+			for (; !ec && it != end; it.increment(ec))
+			{
+				std::error_code e;
+				if (it.depth() > 4)
+				{
+					it.disable_recursion_pending();
+					continue;
+				}
+				const auto& p = it->path();
+				if (p.filename() == "cached_offsets.cache" && it->is_regular_file(e))
+					consider(p);
+			}
+		}
+
+		return have ? best : std::string();
+	}
+
+	std::string OffsetCachePath()
+	{
+		// Not cached on purpose: ArkApi may download a fresh cache after the
+		// plugin was loaded, and the path contains a generation folder.
+		return FindOffsetCacheFile();
+	}
+
+	struct HookName
+	{
+		std::string name;                     // empty = do not install the hook
+		bool in_cache = false;                // the name is present in the offset cache
+		std::string cache_path;
+		std::vector<std::string> variants;    // what the cache has for this method
+	};
+
+	// Picks the hook name: config override > the exact expected name from the
+	// offset cache > the built-in default (only when there is no cache at all).
+	HookName ResolveHookName(const char* method_prefix, const std::string& expected,
+		const std::string& override_name)
+	{
+		HookName result;
+		result.cache_path = OffsetCachePath();
+
+		if (!result.cache_path.empty())
+			ScanOffsetCacheForKeys(result.cache_path, method_prefix, result.variants);
+
+		if (!override_name.empty())
+		{
+			result.name = override_name;
+			result.in_cache = std::find(result.variants.begin(), result.variants.end(), override_name)
+				!= result.variants.end();
+			if (!result.in_cache)
+			{
+				Log::GetLog()->warn("SpawnGuard: hook name override for '{}' is not present in the offset "
+					"cache - using it as forced. If the parameter list does not match the compiled hook, "
+					"the server will crash.", method_prefix);
+			}
+			return result;
+		}
+
+		for (const auto& v : result.variants)
+		{
+			if (v == expected)
+			{
+				result.name = expected;
+				result.in_cache = true;
+				return result;
+			}
+		}
+
+		if (!result.cache_path.empty())
+			result.name.clear();          // cache exists: never guess, see the section comment
+		else
+			result.name = expected;       // no cache to check against - try as before
+
+		return result;
+	}
+
+	void LogHookNameProblem(const char* what, const std::string& expected, const HookName& info)
+	{
+		if (!info.variants.empty())
+		{
+			Log::GetLog()->error("SpawnGuard: '{}' has a different signature in the offset cache.", what);
+			for (const auto& v : info.variants)
+				Log::GetLog()->error("SpawnGuard:   cache:    {}", v);
+			Log::GetLog()->error("SpawnGuard:   expected: {}", expected);
+			Log::GetLog()->error("SpawnGuard: the hook was NOT installed (avoids Sleep(10000) + a throwing "
+				"path in the core). Paste the correct name into General.HookNameOverrides in config.json: "
+				"the parameter list must match the DECLARE_HOOK in Main.cpp, otherwise the server will crash.");
+		}
+		else if (!info.cache_path.empty())
+		{
+			const int class_keys = CountOffsetCacheKeysWithPrefix(info.cache_path, "APrimalStructure.");
+			Log::GetLog()->error("SpawnGuard: '{}' is not in the offset cache ({}); the cache holds {} "
+				"'APrimalStructure.*' names. The function was probably renamed or removed by a game update, "
+				"or ArkApi could not download the cache for this game build - delete ArkApi\\Cache and "
+				"restart the server to force a fresh download.", what, info.cache_path, class_keys);
+		}
+		else
+		{
+			Log::GetLog()->warn("SpawnGuard: offset cache not found, '{}' was tried as-is.", what);
+		}
+	}
+
+	// ------------------------------------------------------------------------
 	// commands
 	// ------------------------------------------------------------------------
 
@@ -1646,6 +1864,39 @@ namespace
 		Reply(pc, "You: " + IntToStr(loc.X) + " " + IntToStr(loc.Y) + " " + IntToStr(loc.Z)
 			+ " | nearest protected point: " + best_zone
 			+ (best > 0.0 ? " at " + FoundationsToStr(best) + " foundations" : ""));
+	}
+
+	void CmdHooks(APlayerController* pc, FString*, bool)
+	{
+		Reply(pc, std::string("IsAllowedToBuild hook: ")
+			+ (g_allow_hook_installed ? g_hook_name_is_allowed : std::string("NOT INSTALLED")));
+		Reply(pc, std::string("FinalStructurePlacement hook: ")
+			+ (g_final_hook_installed ? g_hook_name_final : std::string("off")));
+		Reply(pc, std::string("GameMode.BeginPlay hook: ")
+			+ (g_begin_play_hook_installed ? g_hook_name_begin_play : std::string("NOT INSTALLED")));
+
+		const std::string cache = OffsetCachePath();
+		if (cache.empty())
+		{
+			Reply(pc, "offset cache: NOT FOUND (ArkApi/Cache/.../cached_offsets.cache)");
+			return;
+		}
+
+		Reply(pc, "offset cache: " + cache);
+		Reply(pc, "APrimalStructure.* names in the cache: "
+			+ std::to_string(CountOffsetCacheKeysWithPrefix(cache, "APrimalStructure.")));
+
+		std::vector<std::string> variants;
+		if (ScanOffsetCacheForKeys(cache, "APrimalStructure.IsAllowedToBuild(", variants))
+		{
+			Reply(pc, "cache keys for IsAllowedToBuild (" + std::to_string(variants.size()) + "):");
+			for (const auto& v : variants)
+				Reply(pc, "  " + v);
+		}
+		else
+		{
+			Reply(pc, "cache has NO key starting with APrimalStructure.IsAllowedToBuild(");
+		}
 	}
 
 	void CmdAddPoint(APlayerController* pc, FString* params, bool)
@@ -1866,53 +2117,83 @@ namespace
 
 		if (!g_allow_hook_installed)
 		{
-			bool ok = false;
-			try
-			{
-				ok = hooks.SetHook(kHookIsAllowedToBuild, &Hook_APrimalStructure_IsAllowedToBuild,
-					&APrimalStructure_IsAllowedToBuild_original);
-			}
-			catch (...)
-			{
-				ok = false;
-			}
+			const HookName info = ResolveHookName("APrimalStructure.IsAllowedToBuild(",
+				kHookIsAllowedToBuild, g_config.hook_name_is_allowed);
 
-			g_allow_hook_installed = ok;
-			if (ok)
-				Log::GetLog()->info("SpawnGuard: hook '{}' installed", kHookIsAllowedToBuild);
+			if (!info.name.empty())
+			{
+				bool ok = false;
+				try
+				{
+					ok = hooks.SetHook(info.name, &Hook_APrimalStructure_IsAllowedToBuild,
+						&APrimalStructure_IsAllowedToBuild_original);
+				}
+				catch (...)
+				{
+					ok = false;
+				}
+
+				g_allow_hook_installed = ok;
+				if (ok)
+				{
+					g_hook_name_is_allowed = info.name;
+					Log::GetLog()->info("SpawnGuard: hook installed: {}", info.name);
+				}
+				else
+				{
+					Log::GetLog()->error("SpawnGuard: SetHook('{}') returned false.", info.name);
+				}
+			}
 			else
-				Log::GetLog()->error("SpawnGuard: FAILED to hook '{}'. Check the name in "
-					"cached_offsets.cache and set HooksDoNotThrow=true in Configs/config.json "
-					"while testing.", kHookIsAllowedToBuild);
+			{
+				LogHookNameProblem("APrimalStructure.IsAllowedToBuild", kHookIsAllowedToBuild, info);
+			}
 		}
 
 		if (g_config.enforce_on_final_placement && !g_final_hook_installed)
 		{
-			bool ok = false;
-			try
-			{
-				ok = hooks.SetHook(kHookFinalStructurePlacement, &Hook_APrimalStructure_FinalStructurePlacement,
-					&APrimalStructure_FinalStructurePlacement_original);
-			}
-			catch (...)
-			{
-				ok = false;
-			}
+			const HookName info = ResolveHookName("APrimalStructure.FinalStructurePlacement(",
+				kHookFinalStructurePlacement, g_config.hook_name_final_placement);
 
-			g_final_hook_installed = ok;
-			Log::GetLog()->info("SpawnGuard: hook '{}' {}", kHookFinalStructurePlacement,
-				ok ? "installed" : "FAILED");
+			if (!info.name.empty())
+			{
+				bool ok = false;
+				try
+				{
+					ok = hooks.SetHook(info.name, &Hook_APrimalStructure_FinalStructurePlacement,
+						&APrimalStructure_FinalStructurePlacement_original);
+				}
+				catch (...)
+				{
+					ok = false;
+				}
+
+				g_final_hook_installed = ok;
+				if (ok)
+				{
+					g_hook_name_final = info.name;
+					Log::GetLog()->info("SpawnGuard: hook installed: {}", info.name);
+				}
+				else
+				{
+					Log::GetLog()->error("SpawnGuard: SetHook('{}') returned false.", info.name);
+				}
+			}
+			else
+			{
+				LogHookNameProblem("APrimalStructure.FinalStructurePlacement",
+					kHookFinalStructurePlacement, info);
+			}
 		}
 		else if (!g_config.enforce_on_final_placement && g_final_hook_installed)
 		{
 			try
 			{
-				hooks.DisableHook(kHookFinalStructurePlacement, &Hook_APrimalStructure_FinalStructurePlacement);
+				hooks.DisableHook(g_hook_name_final, &Hook_APrimalStructure_FinalStructurePlacement);
 			}
 			catch (...) {}
 			g_final_hook_installed = false;
-			Log::GetLog()->info("SpawnGuard: hook '{}' removed (EnforceOnFinalPlacement=false)",
-				kHookFinalStructurePlacement);
+			Log::GetLog()->info("SpawnGuard: hook removed (EnforceOnFinalPlacement=false)");
 		}
 	}
 
@@ -1923,14 +2204,14 @@ namespace
 		try
 		{
 			if (g_allow_hook_installed)
-				hooks.DisableHook(kHookIsAllowedToBuild, &Hook_APrimalStructure_IsAllowedToBuild);
+				hooks.DisableHook(g_hook_name_is_allowed, &Hook_APrimalStructure_IsAllowedToBuild);
 		}
 		catch (...) {}
 
 		try
 		{
 			if (g_final_hook_installed)
-				hooks.DisableHook(kHookFinalStructurePlacement, &Hook_APrimalStructure_FinalStructurePlacement);
+				hooks.DisableHook(g_hook_name_final, &Hook_APrimalStructure_FinalStructurePlacement);
 		}
 		catch (...) {}
 
@@ -1950,6 +2231,7 @@ namespace
 		AsaApi::GetCommands().AddConsoleCommand(FString("SG.Rescan"), &CmdRescan);
 		AsaApi::GetCommands().AddConsoleCommand(FString("SG.List"), &CmdList);
 		AsaApi::GetCommands().AddConsoleCommand(FString("SG.Near"), &CmdNear);
+		AsaApi::GetCommands().AddConsoleCommand(FString("SG.Hooks"), &CmdHooks);
 		AsaApi::GetCommands().AddRconCommand(FString("SG.Reload"), &RconReload);
 
 		AsaApi::GetCommands().AddOnTimerCallback(FString("SpawnGuard.Refresh"), &OnTimer);
@@ -1988,6 +2270,11 @@ namespace
 
 		if (!g_config_loaded)
 			LoadConfigFile();
+
+		// If the hook could not be installed earlier (e.g. the offset cache had
+		// not been downloaded yet), try again now - InstallHooks() is idempotent.
+		if (!g_allow_hook_installed)
+			InstallHooks();
 
 		RefreshPoints(true);
 		Log::GetLog()->info("SpawnGuard: initialized ({})", reason);
@@ -2045,16 +2332,36 @@ extern "C" __declspec(dllexport) void Plugin_Init()
 		InstallHooks();        // ... even when config.json is missing or broken
 		RegisterCommands();
 
-		try
+		const HookName begin_play = ResolveHookName("AShooterGameMode.BeginPlay(",
+			kHookGameModeBeginPlay, g_config.hook_name_begin_play);
+		if (!begin_play.name.empty())
 		{
-			AsaApi::GetHooks().SetHook(kHookGameModeBeginPlay, &Hook_AShooterGameMode_BeginPlay,
-				&AShooterGameMode_BeginPlay_original);
+			try
+			{
+				g_begin_play_hook_installed = AsaApi::GetHooks().SetHook(begin_play.name,
+					&Hook_AShooterGameMode_BeginPlay, &AShooterGameMode_BeginPlay_original);
+			}
+			catch (...)
+			{
+				g_begin_play_hook_installed = false;
+			}
+
+			if (g_begin_play_hook_installed)
+			{
+				g_hook_name_begin_play = begin_play.name;
+			}
+			else
+			{
+				Log::GetLog()->error("SpawnGuard: SetHook('{}') returned false", begin_play.name);
+			}
 		}
-		catch (...)
+		else
 		{
-			Log::GetLog()->error("SpawnGuard: FAILED to hook '{}' (the watchdog timer will initialize instead)",
-				kHookGameModeBeginPlay);
+			LogHookNameProblem("AShooterGameMode.BeginPlay", kHookGameModeBeginPlay, begin_play);
 		}
+
+		if (!g_begin_play_hook_installed)
+			Log::GetLog()->warn("SpawnGuard: no BeginPlay hook - the watchdog timer initializes the plugin");
 
 		if (AsaApi::GetApiUtils().GetStatus() == AsaApi::ServerStatus::Ready)
 			EnsureInit("plugin load (server already running)");
@@ -2086,6 +2393,7 @@ extern "C" __declspec(dllexport) void Plugin_Unload()
 			AsaApi::GetCommands().RemoveConsoleCommand(FString("SG.Rescan"));
 			AsaApi::GetCommands().RemoveConsoleCommand(FString("SG.List"));
 			AsaApi::GetCommands().RemoveConsoleCommand(FString("SG.Near"));
+			AsaApi::GetCommands().RemoveConsoleCommand(FString("SG.Hooks"));
 			AsaApi::GetCommands().RemoveRconCommand(FString("SG.Reload"));
 			AsaApi::GetCommands().RemoveOnTimerCallback(FString("SpawnGuard.Refresh"));
 			g_timer_registered = false;
@@ -2093,9 +2401,11 @@ extern "C" __declspec(dllexport) void Plugin_Unload()
 
 		try
 		{
-			AsaApi::GetHooks().DisableHook(kHookGameModeBeginPlay, &Hook_AShooterGameMode_BeginPlay);
+			if (g_begin_play_hook_installed)
+				AsaApi::GetHooks().DisableHook(g_hook_name_begin_play, &Hook_AShooterGameMode_BeginPlay);
 		}
 		catch (...) {}
+		g_begin_play_hook_installed = false;
 
 		g_initialized = false;
 		Log::GetLog()->info("SpawnGuard: unloaded");
