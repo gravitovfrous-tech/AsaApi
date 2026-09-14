@@ -55,8 +55,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <exception>
-#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -1475,107 +1475,200 @@ namespace
 	// exactly which names the cache does contain.
 	// ------------------------------------------------------------------------
 
-	using fsys = std::filesystem;
+	// The path is built with Win32 on purpose: <filesystem> requires /std:c++17
+	// and silently becomes an empty header in C++14 builds, which produces a
+	// cascade of "filesystem: идентификатор не найден" errors. Windows.h is
+	// already included by API/Base.h (WIN32_LEAN_AND_MEAN).
 
-	bool ScanOffsetCacheForKeys(const std::string& path, const std::string& prefix,
-		std::vector<std::string>& matches)
+	std::string ToNarrowString(const std::wstring& text)
 	{
-		std::ifstream in(path, std::ios::binary);
-		if (!in.is_open())
+		if (text.empty())
+			return {};
+		const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+			static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+		if (size <= 0)
+			return {};
+		std::vector<char> buffer(static_cast<size_t>(size));
+		WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+			buffer.data(), size, nullptr, nullptr);
+		return std::string(buffer.begin(), buffer.end());
+	}
+
+	// Directory of the running executable (wide, so non-ASCII server paths work).
+	std::wstring ExecutableDirectory()
+	{
+		wchar_t buffer[MAX_PATH];
+		const DWORD length = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(MAX_PATH));
+		if (length == 0 || length >= MAX_PATH)
+			return {};
+		std::wstring path(buffer, length);
+		const size_t pos = path.find_last_of(L"\\/");
+		return pos == std::wstring::npos ? path : path.substr(0, pos);
+	}
+
+	// Regular, non-empty file? Returns its last write time (comparable as uint64).
+	bool GetRegularFileStamp(const std::wstring& path, unsigned long long& stamp)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+			return false;
+		if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+			return false;
+		if (data.nFileSizeHigh == 0 && data.nFileSizeLow == 0)
 			return false;
 
-		while (in.good())
+		ULARGE_INTEGER time{};
+		time.LowPart = data.ftLastWriteTime.dwLowDateTime;
+		time.HighPart = data.ftLastWriteTime.dwHighDateTime;
+		stamp = time.QuadPart;
+		return true;
+	}
+
+	void FindOffsetCachesIn(const std::wstring& directory, int depth, std::vector<std::wstring>& out)
+	{
+		if (depth > 4 || directory.empty())
+			return;
+
+		WIN32_FIND_DATAW data{};
+		const std::wstring mask = directory + L"\\*";
+		HANDLE handle = FindFirstFileW(mask.c_str(), &data);
+		if (handle == INVALID_HANDLE_VALUE)
+			return;
+
+		do
+		{
+			const std::wstring name(data.cFileName);
+			if (name == L"." || name == L"..")
+				continue;
+
+			const std::wstring full = directory + L"\\" + name;
+			if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+				FindOffsetCachesIn(full, depth + 1, out);
+			else if (name == L"cached_offsets.cache")
+				out.push_back(full);
+		} while (FindNextFileW(handle, &data) != 0);
+
+		FindClose(handle);
+	}
+
+	struct CacheFile
+	{
+		bool found = false;
+		std::wstring wpath;
+		std::string apath;            // for log messages and SG.Hooks
+		unsigned long long stamp = 0;
+	};
+
+	CacheFile FindOffsetCacheFile()
+	{
+		CacheFile best;
+
+		const std::wstring exe_dir = ExecutableDirectory();
+		if (exe_dir.empty())
+			return best;
+
+		std::vector<std::wstring> candidates;
+		const std::wstring cache_root = exe_dir + L"\\ArkApi\\Cache";
+		candidates.push_back(cache_root + L"\\cached_offsets.cache");
+		candidates.push_back(exe_dir + L"\\ArkApi\\cached_offsets.cache");
+		candidates.push_back(exe_dir + L"\\cached_offsets.cache");
+
+		FindOffsetCachesIn(cache_root, 0, candidates);
+
+		for (const auto& candidate : candidates)
+		{
+			unsigned long long stamp = 0;
+			if (!GetRegularFileStamp(candidate, stamp))
+				continue;
+			if (!best.found || stamp > best.stamp)
+			{
+				best.found = true;
+				best.wpath = candidate;
+				best.apath = ToNarrowString(candidate);
+				best.stamp = stamp;
+			}
+		}
+
+		return best;
+	}
+
+	// Reads the whole file through Win32 (std::ifstream has no wide-path
+	// constructor that is guaranteed to be available in every build).
+	bool ReadWholeFileW(const std::wstring& path, std::vector<char>& out)
+	{
+		out.clear();
+
+		HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+			nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (handle == INVALID_HANDLE_VALUE)
+			return false;
+
+		LARGE_INTEGER size{};
+		if (!GetFileSizeEx(handle, &size) || size.QuadPart <= 0 || size.QuadPart > (64LL << 20))
+		{
+			CloseHandle(handle);
+			return false;
+		}
+
+		out.resize(static_cast<size_t>(size.QuadPart));
+		DWORD read = 0;
+		const BOOL ok = ReadFile(handle, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+		CloseHandle(handle);
+
+		if (!ok)
+			return false;
+
+		out.resize(read);
+		return !out.empty();
+	}
+
+	// Parses the serialized unordered_map<string, intptr_t>:
+	//     repeat: [uint64 key_size][key bytes][int64 value]
+	// and collects every key that starts with the given prefix.
+	bool ScanOffsetCacheForKeys(const std::wstring& path, const std::string& prefix,
+		std::vector<std::string>& matches)
+	{
+		matches.clear();
+
+		std::vector<char> data;
+		if (!ReadWholeFileW(path, data))
+			return false;
+
+		size_t offset = 0;
+		while (offset + sizeof(std::uint64_t) <= data.size())
 		{
 			std::uint64_t key_size = 0;
-			in.read(reinterpret_cast<char*>(&key_size), sizeof(key_size));
-			if (!in || key_size == 0 || key_size > (1ULL << 20))
-				break;
+			std::memcpy(&key_size, data.data() + offset, sizeof(key_size));
+			offset += sizeof(key_size);
 
-			std::string key(static_cast<size_t>(key_size), '\0');
-			in.read(key.data(), static_cast<std::streamsize>(key_size));
-			if (!in)
-				break;
+			if (key_size == 0 || key_size > (1ULL << 20)
+				|| offset + static_cast<size_t>(key_size) + sizeof(std::int64_t) > data.size())
+			{
+				break;   // unexpected format: stop, keep what was collected so far
+			}
 
-			std::int64_t value = 0;
-			in.read(reinterpret_cast<char*>(&value), sizeof(value));
-			if (!in)
-				break;
+			const std::string key(data.data() + offset, static_cast<size_t>(key_size));
+			if (key.compare(0, prefix.size(), prefix) == 0)
+				matches.push_back(key);
 
-			if (key.size() >= prefix.size() && key.compare(0, prefix.size(), prefix) == 0)
-				matches.push_back(std::move(key));
+			offset += static_cast<size_t>(key_size) + sizeof(std::int64_t);
 		}
+
 		return !matches.empty();
 	}
 
-	int CountOffsetCacheKeysWithPrefix(const std::string& path, const std::string& prefix)
+	int CountOffsetCacheKeysWithPrefix(const std::wstring& path, const std::string& prefix)
 	{
 		std::vector<std::string> matches;
 		ScanOffsetCacheForKeys(path, prefix, matches);
 		return static_cast<int>(matches.size());
 	}
 
-	std::string FindOffsetCacheFile()
-	{
-		std::error_code ec;
-		const fsys::path cwd(AsaApi::Tools::GetCurrentDir());
-		const fsys::path cache_root = cwd / "ArkApi" / "Cache";
-
-		std::string best;
-		fsys::file_time_type best_time{};
-		bool have = false;
-
-		auto consider = [&](const fsys::path& p)
-		{
-			std::error_code e;
-			if (!fsys::is_regular_file(p, e) || e)
-				return;
-			const auto t = fsys::last_write_time(p, e);
-			if (!have || e || t > best_time)
-			{
-				have = true;
-				best = p.string();
-				best_time = e ? fsys::file_time_type{} : t;
-			}
-		};
-
-		consider(cache_root / "cached_offsets.cache");
-		consider(cwd / "ArkApi" / "cached_offsets.cache");
-		consider(cwd / "cached_offsets.cache");
-
-		if (fsys::is_directory(cache_root, ec))
-		{
-			fsys::recursive_directory_iterator it(
-				cache_root, fsys::directory_options::skip_permission_denied, ec);
-			const fsys::recursive_directory_iterator end;
-			for (; !ec && it != end; it.increment(ec))
-			{
-				std::error_code e;
-				if (it.depth() > 4)
-				{
-					it.disable_recursion_pending();
-					continue;
-				}
-				const auto& p = it->path();
-				if (p.filename() == "cached_offsets.cache" && it->is_regular_file(e))
-					consider(p);
-			}
-		}
-
-		return have ? best : std::string();
-	}
-
-	std::string OffsetCachePath()
-	{
-		// Not cached on purpose: ArkApi may download a fresh cache after the
-		// plugin was loaded, and the path contains a generation folder.
-		return FindOffsetCacheFile();
-	}
-
 	struct HookName
 	{
 		std::string name;                     // empty = do not install the hook
 		bool in_cache = false;                // the name is present in the offset cache
-		std::string cache_path;
+		CacheFile cache;
 		std::vector<std::string> variants;    // what the cache has for this method
 	};
 
@@ -1585,10 +1678,10 @@ namespace
 		const std::string& override_name)
 	{
 		HookName result;
-		result.cache_path = OffsetCachePath();
+		result.cache = FindOffsetCacheFile();
 
-		if (!result.cache_path.empty())
-			ScanOffsetCacheForKeys(result.cache_path, method_prefix, result.variants);
+		if (result.cache.found)
+			ScanOffsetCacheForKeys(result.cache.wpath, method_prefix, result.variants);
 
 		if (!override_name.empty())
 		{
@@ -1614,7 +1707,7 @@ namespace
 			}
 		}
 
-		if (!result.cache_path.empty())
+		if (result.cache.found)
 			result.name.clear();          // cache exists: never guess, see the section comment
 		else
 			result.name = expected;       // no cache to check against - try as before
@@ -1634,13 +1727,13 @@ namespace
 				"path in the core). Paste the correct name into General.HookNameOverrides in config.json: "
 				"the parameter list must match the DECLARE_HOOK in Main.cpp, otherwise the server will crash.");
 		}
-		else if (!info.cache_path.empty())
+		else if (info.cache.found)
 		{
-			const int class_keys = CountOffsetCacheKeysWithPrefix(info.cache_path, "APrimalStructure.");
+			const int class_keys = CountOffsetCacheKeysWithPrefix(info.cache.wpath, "APrimalStructure.");
 			Log::GetLog()->error("SpawnGuard: '{}' is not in the offset cache ({}); the cache holds {} "
 				"'APrimalStructure.*' names. The function was probably renamed or removed by a game update, "
 				"or ArkApi could not download the cache for this game build - delete ArkApi\\Cache and "
-				"restart the server to force a fresh download.", what, info.cache_path, class_keys);
+				"restart the server to force a fresh download.", what, info.cache.apath, class_keys);
 		}
 		else
 		{
@@ -1875,19 +1968,19 @@ namespace
 		Reply(pc, std::string("GameMode.BeginPlay hook: ")
 			+ (g_begin_play_hook_installed ? g_hook_name_begin_play : std::string("NOT INSTALLED")));
 
-		const std::string cache = OffsetCachePath();
-		if (cache.empty())
+		const CacheFile cache = FindOffsetCacheFile();
+		if (!cache.found)
 		{
-			Reply(pc, "offset cache: NOT FOUND (ArkApi/Cache/.../cached_offsets.cache)");
+			Reply(pc, "offset cache: NOT FOUND (looked for ArkApi/Cache/**/cached_offsets.cache)");
 			return;
 		}
 
-		Reply(pc, "offset cache: " + cache);
+		Reply(pc, "offset cache: " + cache.apath);
 		Reply(pc, "APrimalStructure.* names in the cache: "
-			+ std::to_string(CountOffsetCacheKeysWithPrefix(cache, "APrimalStructure.")));
+			+ std::to_string(CountOffsetCacheKeysWithPrefix(cache.wpath, "APrimalStructure.")));
 
 		std::vector<std::string> variants;
-		if (ScanOffsetCacheForKeys(cache, "APrimalStructure.IsAllowedToBuild(", variants))
+		if (ScanOffsetCacheForKeys(cache.wpath, "APrimalStructure.IsAllowedToBuild(", variants))
 		{
 			Reply(pc, "cache keys for IsAllowedToBuild (" + std::to_string(variants.size()) + "):");
 			for (const auto& v : variants)

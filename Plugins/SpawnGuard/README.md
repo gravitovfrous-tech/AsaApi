@@ -289,6 +289,35 @@ python Plugins/SpawnGuard/tools/check_macro_collisions.py
   из `config.json` бросит исключение внутри хука;
 * `SetHook` всегда оборачивайте в `try/catch` (см. п. 1.3).
 
+### 2.4 Никакого C++17 и `<filesystem>` (стандарт у проекта — C++14)
+
+Проект собирается как **C++14** (`LanguageStandard` не поднят до `stdcpp17`).
+Практическое следствие: `<filesystem>` и `std::filesystem` использовать нельзя —
+на этом пути сборка падает каскадом `filesystem: идентификатор не найден`,
+`C2039`, `C2873` и т. п. (проверено на живой сборке). Поэтому весь разбор путей
+и чтение файлов кэша в `Main.cpp` сделаны **только на Win32 API**
+(`GetModuleFileNameW`, `GetFileAttributesExW`, `FindFirstFileW`/`FindNextFileW`,
+`CreateFileW`/`GetFileSizeEx`/`ReadFile`) — этот код компилируется и в C++14, и в
+C++17, и не тянет STL-переключателей.
+
+Второе следствие того же стандарта: **`std::string::data()` в C++14 возвращает
+`const char*`**, записывать в этот буфер нельзя (в C++17 — можно). Во всех местах,
+где нужен изменяемый буфер, используется `std::vector<char>` /
+`std::vector<wchar_t>` и `.data()` уже от вектора.
+
+Итого — при правках `Main.cpp`:
+
+| Нельзя | Можно вместо этого |
+| --- | --- |
+| `#include <filesystem>`, `std::filesystem::*` | Win32-хелперы `ExecutableDirectory()`, `GetRegularFileStamp()`, `FindOffsetCachesIn()`, `ReadWholeFileW()` |
+| `str.data()` как `char*` для записи | `std::vector<char> buf(n); buf.data()` |
+| `std::optional`, `std::string_view`, `std::clamp`, `std::size` | ручные проверки/`std::min`/`std::string` |
+
+Проверить сборку на C++14 без MSVC можно так: вырезать блок offset-кэша из
+`Main.cpp` в тестовый файл с заглушками Win32 и собрать `g++ -std=c++14 -Wall
+-Wextra` — именно так этот блок и проверялся (компилируется без предупреждений,
+поиск и разбор `cached_offsets.cache` проверены на синтетическом кэше).
+
 ### 2.4 Установка
 
 ```
