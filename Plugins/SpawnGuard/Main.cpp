@@ -51,6 +51,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -370,6 +371,11 @@ namespace
 	int g_volume_attempts = 0;
 	bool g_volumes_frozen = false;
 
+	// RCON packets are processed on the RCON thread, so a reload requested over
+	// RCON must not touch config/hooks directly - it only sets this flag and the
+	// game thread (OnTimer) performs the reload.
+	std::atomic<bool> g_pending_reload{ false };
+
 	// Life cycle / diagnostics (game thread only).
 	bool g_initialized = false;
 	bool g_timer_registered = false;
@@ -404,8 +410,10 @@ namespace
 		return g_plugin_dir;
 	}
 
+	// Safe to call from any thread (commands may also arrive over RCON).
 	std::string SenderName()
 	{
+		std::lock_guard<std::mutex> lock(g_runtime_mutex);
 		return g_config.chat_sender.empty() ? std::string("SpawnGuard") : g_config.chat_sender;
 	}
 
@@ -661,7 +669,9 @@ namespace
 		rt->cooldown_seconds = g_config.message_cooldown_seconds;
 		rt->use_engine_drop_check = g_config.use_engine_drop_check && g_config.drops.enabled;
 		rt->use_engine_drop_check_on_preview = g_config.use_engine_drop_check_on_preview;
-		rt->chat_sender = SenderName();
+		// NOTE: do not call SenderName() here - this function already holds the
+		// mutex, and std::mutex is not recursive.
+		rt->chat_sender = g_config.chat_sender.empty() ? std::string("SpawnGuard") : g_config.chat_sender;
 		rt->drops_rules = g_config.drops;
 
 		if (g_config.spawn.enabled && !g_spawns.empty())
@@ -1396,8 +1406,8 @@ namespace
 			UWorld* world = AsaApi::GetApiUtils().GetWorld();
 			if (world)
 			{
-				UE::Math::TVector<double> check(loc.X, loc.Y, loc.Z);
-				if (IsPointNearSupplyCrateSpawnSafe(world, &check))
+				UE::Math::TVector<double> probe(loc.X, loc.Y, loc.Z);
+				if (IsPointNearSupplyCrateSpawnSafe(world, &probe))
 				{
 					const ZoneRules& rules = rt->drops_rules;
 					if (!(rules.ignore_admins && is_admin()))
@@ -1507,10 +1517,15 @@ namespace
 
 	void RconReload(RCONClientConnection* conn, RCONPacket* packet, UWorld*)
 	{
-		const bool ok = LoadConfigFile();
-		if (ok)
-			RefreshPoints(true);
-		FString reply = ok ? FString("SpawnGuard reloaded") : FString("SpawnGuard reload failed");
+		// This callback runs on the RCON thread: never touch the config, the
+		// hooks or the world from here. The game thread picks the request up in
+		// OnTimer() within a second.
+		if (!conn || !packet)
+			return;
+
+		g_pending_reload = true;
+
+		FString reply = FString("SpawnGuard: reload queued (applied within a second)");
 		conn->SendMessageW(packet->Id, 0, &reply);
 	}
 
@@ -1593,7 +1608,11 @@ namespace
 		double best = -1.0;
 		std::string best_zone = "none";
 
-		auto check = [&](const std::string& id, const FVector& p)
+		// NOTE: never name a variable or a lambda "check", "verify" or "ensure":
+		// those are function-like macros in the UE headers that AsaApi includes
+		// (API/UE/Misc/AssertionMacros.h), and the preprocessor rewrites any
+		// "check(...)" into an assertion, which produces a cascade of parse errors.
+		auto consider = [&](const std::string& id, const FVector& p)
 		{
 			const double d = std::sqrt(DistanceSq2D(loc, p));
 			if (best < 0.0 || d < best)
@@ -1608,13 +1627,13 @@ namespace
 			for (const auto& g : rt->groups)
 			{
 				for (const auto& p : g.points)
-					check(g.id, p.loc);
+					consider(g.id, p.loc);
 			}
 			for (const auto& v : rt->volumes)
 			{
 				for (const auto& b : v.boxes)
 				{
-					check(v.id, b.center);
+					consider(v.id, b.center);
 					if (PointInsideBox(b, loc, v.padding_uu))
 					{
 						best = 0.0;
@@ -1976,6 +1995,20 @@ namespace
 
 	void OnTimer()
 	{
+		// Deferred reload (requested over RCON from another thread).
+		if (g_pending_reload.exchange(false))
+		{
+			if (LoadConfigFile())
+			{
+				RefreshPoints(true);
+				Log::GetLog()->info("SpawnGuard: deferred reload done");
+			}
+			else
+			{
+				Log::GetLog()->error("SpawnGuard: deferred reload FAILED - see the log above");
+			}
+		}
+
 		if (!g_initialized)
 		{
 			EnsureInit("timer watchdog");
