@@ -1,0 +1,7 @@
+{
+    "FullName": "Pickup",
+    "Description": "Подбор структур своего племени рядом с игроком: /pickup [тип] [радиус], /подбор w 5",
+    "Version": 1.0,
+    "MinApiVersion": 2.03,
+    "Dependencies": []
+}
