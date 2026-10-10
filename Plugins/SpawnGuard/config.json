@@ -1,0 +1,107 @@
+{
+    "General": {
+        "Enabled": true,
+        "ChatSenderName": "SpawnGuard",
+        "LogDiscoveredPoints": true,
+        "RefreshSpawnPointsSeconds": 30,
+
+        "BlockReturnValue": 1,
+        "MessageCooldownSeconds": 2.0,
+        "DebugLogPlacements": false,
+        "DebugLogLines": 8,
+        "EnforceOnFinalPlacement": false,
+
+        "_HookNameOverrides_comment": "Пусто = имя берётся из ArkApi/Cache/.../cached_offsets.cache. Если после обновления игры в логе 'Failed to get the offset of ...' — смотрите имя там же командой 'cheat SG.Hooks' и вписывайте сюда ТОЧНУЮ строку из кэша. Внимание: список параметров должен совпадать с DECLARE_HOOK в Main.cpp, иначе сервер упадёт.",
+        "HookNameOverrides": {
+            "IsAllowedToBuild": "",
+            "FinalStructurePlacement": "",
+            "GameModeBeginPlay": ""
+        }
+    },
+
+    "SpawnPoints": {
+        "Enabled": true,
+        "IgnoreAdmins": false,
+        "BlockMode": "BlockAll",
+        "RangeInFoundations": 8,
+        "StructuresWhiteList": [
+            "PrimalItemStructure_SleepingBag_Hide",
+            "PrimalItemStructure_SleepableSleepingbag"
+        ],
+        "StructuresBlackList": [],
+        "Messages": {
+            "SendNotification": true,
+            "SendChatMessage": true,
+            "NotificationText": "You cannot build near a player spawn point!",
+            "ChatMessageText": "You cannot build near a player spawn point!",
+            "NotificationColor": { "R": 1.0, "G": 0.25, "B": 0.1, "A": 1.0 }
+        }
+    },
+
+    "SupplyDrops": {
+        "Enabled": true,
+        "IgnoreAdmins": false,
+        "BlockMode": "BlockAll",
+        "RangeInFoundations": 10,
+        "ProtectActiveCrates": true,
+        "ProtectDropVolumes": true,
+        "VolumePaddingUU": 0,
+        "UseEngineDropSpawnCheck": true,
+        "UseEngineDropSpawnCheckOnPreview": false,
+        "StructuresWhiteList": [],
+        "StructuresBlackList": [],
+        "Messages": {
+            "SendNotification": true,
+            "SendChatMessage": true,
+            "NotificationText": "You cannot build near a supply drop!",
+            "ChatMessageText": "You cannot build near a supply drop!",
+            "NotificationColor": { "R": 0.2, "G": 0.6, "B": 1.0, "A": 1.0 }
+        }
+    },
+
+    "ExplorerNotes": {
+        "Enabled": true,
+        "IgnoreAdmins": false,
+        "BlockMode": "BlockAll",
+        "RangeInFoundations": 2,
+        "BaseClassNames": [
+            "/Game/PrimalEarth/CoreBlueprints/ExplorerChest/ExplorerChest_Base.ExplorerChest_Base_C",
+            "Blueprint'/Game/PrimalEarth/CoreBlueprints/ExplorerChest/ExplorerChest_Base.ExplorerChest_Base_C'",
+            "ExplorerChest_Base_C"
+        ],
+        "NameContains": [
+            "explorernote",
+            "explorerchest",
+            "explorer_note",
+            "explorer_chest",
+            "note_hlna",
+            "fjordurrune"
+        ],
+        "StructuresWhiteList": [],
+        "StructuresBlackList": [],
+        "Messages": {
+            "SendNotification": true,
+            "SendChatMessage": true,
+            "NotificationText": "You cannot build near an explorer note!",
+            "ChatMessageText": "You cannot build near an explorer note!",
+            "NotificationColor": { "R": 1.0, "G": 0.85, "B": 0.2, "A": 1.0 }
+        }
+    },
+
+    "CustomZones": {
+        "Enabled": true,
+        "IgnoreAdmins": false,
+        "BlockMode": "BlockAll",
+        "DefaultRangeInFoundations": 10,
+        "StructuresWhiteList": [],
+        "StructuresBlackList": [],
+        "Messages": {
+            "SendNotification": true,
+            "SendChatMessage": true,
+            "NotificationText": "You cannot build in a restricted zone!",
+            "ChatMessageText": "You cannot build in a restricted zone!",
+            "NotificationColor": { "R": 1.0, "G": 0.4, "B": 0.0, "A": 1.0 }
+        },
+        "Zones": []
+    }
+}

@@ -1,0 +1,99 @@
+// Сценарии выбора имени хука (ResolveHookName): точное совпадение, подстановка
+// ABI-совместимого ключа, отказ при неоднозначности, override из конфига.
+// Код плагина подставляется скриптом run_tests.sh.
+#include "stubs_win32.hpp"
+#include <iostream>
+#include <fstream>
+#include <cstdlib>
+
+namespace
+{
+// @PLUGIN_CODE@
+}
+
+// ---- сценарии ----
+#include <sstream>
+
+static int failures = 0;
+
+static void write_cache(const std::string& exe_dir, const std::vector<std::string>& keys)
+{
+    const std::string dir = exe_dir + "/ArkApi/Cache";
+    std::string cmd = "mkdir -p '" + dir + "'";
+    if (system(cmd.c_str()) != 0) { std::cout << "не создать " << dir << "\n"; return; }
+
+    std::vector<char> blob;
+    for (const auto& key : keys)
+    {
+        const std::uint64_t len = key.size();
+        const char* lp = reinterpret_cast<const char*>(&len);
+        blob.insert(blob.end(), lp, lp + sizeof(len));
+        blob.insert(blob.end(), key.begin(), key.end());
+        const std::int64_t value = 0x1234;
+        const char* vp = reinterpret_cast<const char*>(&value);
+        blob.insert(blob.end(), vp, vp + sizeof(value));
+    }
+    std::ofstream out(dir + "/cached_offsets.cache", std::ios::binary);
+    out.write(blob.data(), blob.size());
+}
+
+static void check(bool condition, const char* what)
+{
+    if (!condition) { std::cout << "FAIL: " << what << "\n"; ++failures; }
+    else std::cout << "ok  : " << what << "\n";
+}
+
+int main()
+{
+    auto use = [](const char* dir) {
+        g_test_root = dir;
+        return std::string(dir);
+    };
+
+    const std::string kBuiltIn = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool,APawn*)";
+    const std::string kCachedWrong = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TVector<double>,bool,bool,APawn*)";
+    const std::string kCachedRef = "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData*,bool,UE::Math::TRotator<double>,bool,bool,APawn*)";
+
+    // 1) точное совпадение
+    write_cache(use("scenario1"), { kBuiltIn, "APrimalStructure.Other()" });
+    HookName r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, "");
+    check(r.name == kBuiltIn && r.in_cache && !r.substituted, "точный ключ -> берём как есть");
+
+    // 2) в кэше только вариант с TVector (случай из лога) -> подстановка
+    write_cache(use("scenario2"), { kCachedWrong });
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, "");
+    check(r.name == kCachedWrong && r.in_cache && r.substituted, "кэш с TVector -> ABI-совместимая подстановка");
+
+    // 3) подстановка по ссылке/указателю
+    write_cache(use("scenario3"), { kCachedRef });
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, "");
+    check(r.name == kCachedRef && r.substituted, "FPlacementData& -> подстановка");
+
+    // 4) два совместимых ключа -> не гадаем
+    write_cache(use("scenario4"), { kCachedWrong, kCachedRef });
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, "");
+    check(r.name.empty(), "два совместимых ключа -> хук не ставим (чтобы не угадать неверно)");
+
+    // 5) кэша нет -> пробуем встроенное имя
+    use("scenario5");
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, "");
+    check(r.name == kBuiltIn && !r.in_cache, "кэш не найден -> встроенное имя");
+
+    // 6) override имеет приоритет
+    write_cache(use("scenario6"), { kBuiltIn });
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, kCachedWrong);
+    check(r.name == kCachedWrong && !r.in_cache,
+        "override вне кэша -> форсируем с предупреждением (in_cache=false)");
+
+    write_cache(use("scenario8"), { kBuiltIn, kCachedWrong });
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, kCachedWrong);
+    check(r.name == kCachedWrong && r.in_cache, "override, который есть в кэше -> приоритет и in_cache=true");
+
+    // 7) несовместимый ключ -> отказаться
+    write_cache(use("scenario7"), { "APrimalStructure.IsAllowedToBuild(APlayerController*,UE::Math::TVector<double>,UE::Math::TRotator<double>,FPlacementData&,bool,UE::Math::TRotator<double>,bool,bool,FName)" });
+    r = ResolveHookName("APrimalStructure.IsAllowedToBuild(", kBuiltIn, "");
+    check(r.name.empty() && !r.variants.empty(), "несовместимый ключ -> хук не ставим");
+
+    std::cout << (failures ? "ПРОВАЛЕНО: " : "ВСЕ СЦЕНАРИИ ПРОЙДЕНЫ, ошибок: ") << failures << "\n";
+    return failures ? 1 : 0;
+}
